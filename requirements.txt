@@ -1,0 +1,3 @@
+pyserial
+Pillow
+psutil  # optional, for data usage graphs 
