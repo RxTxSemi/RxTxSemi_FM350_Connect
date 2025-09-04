@@ -47,3 +47,38 @@ newgrp dialout
 You may need to **log out and log back in** for changes to take effect.  
 
 ---
+
+## ⚙️ Configure udev Rules
+
+In some cases, **ModemManager may interfere** with the FM350-GL modem.  
+You can add a udev rule to prevent ModemManager from claiming the device.
+
+### Step 1: Create the rule file
+Open a new udev rules file:
+
+```bash
+sudo nano /etc/udev/rules.d/99-fm350.rules
+```
+
+### Step 2: Add the rule
+Paste the following line inside the file:
+
+```text
+ATTRS{idVendor}=="0e8d", ATTRS{idProduct}=="7127", ENV{ID_MM_DEVICE_IGNORE}="1"
+```
+
+### Step 3: Reload and apply rules
+Run the following commands:
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+### Step 4: Restart ModemManager
+```bash
+sudo systemctl restart ModemManager
+```
+
+---
+

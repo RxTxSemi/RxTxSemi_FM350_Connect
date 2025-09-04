@@ -19,6 +19,8 @@ import tkinter.simpledialog
 from PIL import Image, ImageTk
 import webbrowser
 import sys
+import shlex
+
 try:
     import psutil
 except ImportError:
@@ -37,7 +39,29 @@ except AttributeError:
             resample_lanczos = 1  # Fallback value for LANCZOS
 
 class FibocomMonitor:
+
+    def update_cells_tab(self):
+        """Updates the cells tab with current signal information."""
+        # This is a placeholder. You need to fill this with the logic
+        # to update your specific Tkinter widgets.
+        if self.debug_mode:
+            print("DEBUG: Updating cells tab UI.")
+            
+        # Example of how you would update a label for an LTE cell
+        lte_info = next((cell for cell in self.cells_info if cell['rat'] == 'LTE'), None)
+        if lte_info:
+            # Example: self.lte_label.config(text=f"RSRP: {lte_info['rsrp']}")
+            pass
+            
+        # Example of how you would update a label for an NR cell
+        nr_info = next((cell for cell in self.cells_info if cell['rat'] == 'NR'), None)
+        if nr_info:
+            # Example: self.nr_label.config(text=f"RSRP: {nr_info['rsrp']}")
+            pass
+
+
     def __init__(self, root):
+        self.serial_lock = threading.Lock()
         self.root = root
         self.root.title("RxTxSemi FM350gl Connect")
         self.root.geometry("800x500")
@@ -369,19 +393,19 @@ class FibocomMonitor:
         print(f"Debug mode: {'ON' if self.debug_mode else 'OFF'}")
             
     def run_privileged_command(self, cmd, input_data=None):
-        """Run a privileged command using pkexec for native GUI password prompt. If cmd is a string, run it as a root shell."""
-        import subprocess
+        """Run a command as root via pkexec – SAFE version."""
         if isinstance(cmd, str):
-            # Wrap the command in a bash shell and run the shell as root
-            shell_cmd = ["pkexec", "bash", "-c", cmd]
-            result = subprocess.run(shell_cmd, capture_output=True, text=True, input=input_data)
-        else:
-            if cmd[0] == 'sudo':
-                cmd[0] = 'pkexec'
-            elif cmd[0] != 'pkexec':
-                cmd = ['pkexec'] + cmd
-            result = subprocess.run(cmd, capture_output=True, text=True, input=input_data)
-        return result
+            # If it's a complex batch (contains &&, |, >), run via shell
+            if any(op in cmd for op in ["&&", "|", ">", "<"]):
+                return subprocess.run(["pkexec", "bash", "-c", cmd],
+                                      capture_output=True, text=True, input=input_data)
+            cmd = shlex.split(cmd)
+
+        if cmd[0] == 'sudo':
+            cmd[0] = 'pkexec'
+        elif cmd[0] != 'pkexec':
+            cmd = ['pkexec'] + cmd
+        return subprocess.run(cmd, capture_output=True, text=True, input=input_data)
             
     def connect_to_modem(self):
         """Connect to the modem and configure network"""
@@ -391,78 +415,102 @@ class FibocomMonitor:
             if not self.check_fibocom_device():
                 messagebox.showerror("Device Error", "Fibocom FM350-GL device not found or not connected via USB")
                 return
-            # Step 2 Check if selected port is available
+
+            # Step 2: Check if selected port is available
             self.update_status("Checking port availability...")
             port = self.port_var.get()
             if not os.path.exists(port):
                 messagebox.showerror("Port Error", f"{port} not available")
                 return
-            # Step3 Connect to selected port
+
+            # Step 3: Connect to selected port
             self.update_status("Connecting to modem...")
             self.serial_port = serial.Serial(port, 115200, timeout=1)
-            
+
             # Initialize modem
-            self.send_at_command("ATE1")  # Enable echo
-            self.send_at_command("AT+CMEE=2")  # Enable error reporting
-            
+            self.send_at_command("ATE1")        # Enable echo
+            self.send_at_command("AT+CMEE=2")   # Enable error reporting
+
             # Step 4: Configure APN and activate connection
             self.update_status("Configuring APN...")
             apn = self.apn_var.get()
             if not self.configure_apn(apn):
                 messagebox.showerror("APN Error", f"Failed to configure APN: {apn}")
                 return
-            
-            # Step 5
+
+            # Step 5: Get IP address
             self.update_status("Getting IP address...")
             ip_address = self.get_ip_address()
             if not ip_address:
                 messagebox.showerror("IP Error", "Failed to get IP address from modem")
                 return
-            
+
+            # Derive gateway (assume .1)
+            gateway = ".".join(ip_address.split(".")[:3]) + ".1"
+
             # Step 6: Find interface
             self.update_status("Finding modem interface...")
             interface = self.find_modem_interface()
             if not interface:
                 messagebox.showerror("Network Error", "Could not find modem network interface")
                 return
-            
+
+            # Step 6.1: Get DNS from modem
+            self.update_status("Getting DNS servers...")
+            dns1, dns2 = "8.8.8.8", "1.1.1.1"  # fallback
+            try:
+                self.serial_port.write(b"AT+GTDNS=1\r")
+                time.sleep(0.5)
+                dns_resp = self.serial_port.read(200).decode(errors="ignore")
+                for line in dns_resp.splitlines():
+                    if "+GTDNS" in line:
+                        parts = line.split('"')
+                        if len(parts) >= 4:
+                            dns1, dns2 = parts[1], parts[3]
+                            break
+            except Exception:
+                pass
+
             # Step 7: Batch all privileged commands
             self.update_status("Configuring system (network, DNS, services)...")
-            dns_config = "nameserver 8.8.8.8\\nnameserver 1.1.1.1"
             batch_cmd = (
                 f"systemctl stop ModemManager && "
-                f"ip addr add {ip_address}/32 dev {interface} || true && "
+                f"ip addr flush dev {interface} && "
+                f"ip route flush dev {interface} && "
+                f"ip addr add {ip_address}/24 dev {interface} && "
                 f"ip link set {interface} up && "
-                f"ip route del default || true && "
-                f"ip route add default dev {interface} || true && "
-                f"cp /etc/resolv.conf /etc/resolv.conf.backup && "
-                f"echo -e '{dns_config}' | tee /etc/resolv.conf"
+                f"ip route add default via {gateway} dev {interface} metric 100 && "
+                f"cp /etc/resolv.conf /etc/resolv.conf.backup || true && "
+                f"echo -e 'nameserver {dns1}\\nnameserver {dns2}' | tee /etc/resolv.conf"
             )
             result = self.run_privileged_command(batch_cmd)
             if result.returncode != 0:
                 messagebox.showerror("Sudo Error", f"Failed to configure system: {result.stderr}\nAre you running as root or with passwordless sudo?")
                 return
+
             self.modemmanager_stopped = True
             self.network_configured = True
             self.dns_changed = True
-            self.interface_name = interface # Set interface name for data usage
-            
+            self.interface_name = interface  # Set interface name for data usage
+
             # Get modem information
             self.get_modem_info()
-            
+
             # Start monitoring thread
             self.monitoring = True
             self.monitor_thread = threading.Thread(target=self.monitoring_loop, daemon=True)
             self.monitor_thread.start()
-            
+
             # Update UI
             self.connect_btn.config(text="Disconnect")
             self.status_label.config(text="Connected", style='Status.TLabel')
             self.update_status("Connection established successfully!")
-            
+
         except Exception as e:
             messagebox.showerror("Connection Error", f"Failed to connect to modem: {str(e)}")
             self.update_status("Connection failed")
+
+
     
     def check_fibocom_device(self):
         """Check if Fibocom FM350-GL device is connected via USB"""
@@ -518,57 +566,45 @@ class FibocomMonitor:
             return False
     
     def get_ip_address(self):
-        """Get IP address from modem"""
+        """Get IP address from modem (IPv4 only)"""
         try:
             response = self.send_at_command("AT+CGPADDR=1")
             if "ERROR" in response:
                 return None
-            
+
             if self.debug_mode:
-                print(f"DEBUG: Parsing CGPADDR response: {repr(response)}")
-            
-            # Parse IP address from response
-            lines = response.split('\n')
-            for line in lines:
-                if "+CGPADDR:" in line:
+                print(f"DEBUG: CGPADDR raw response: {repr(response)}")
+
+            ip_address = None
+            for line in response.splitlines():
+                line = line.strip()
+                if "+CGPADDR" in line:
                     if self.debug_mode:
                         print(f"DEBUG: Found CGPADDR line: {repr(line)}")
-                    parts = line.split(',')
+                    parts = line.split('"')
                     if len(parts) >= 2:
+                        candidate = parts[1]
                         if self.debug_mode:
-                            print(f"DEBUG: Split parts: {parts}")
-                        
-                        # Extract the IP address from the second part (index 1)
-                        ip_part = parts[1].strip()
-                        if self.debug_mode:
-                            print(f"DEBUG: IP part before processing: {repr(ip_part)}")
-                        
-                        # Remove quotes if present
-                        if len(ip_part) >= 2 and ip_part[0] == '"' and ip_part[-1] == '"':
-                            ip_address = ip_part[1:-1]  # Remove quotes
-                            if self.debug_mode:
-                                print(f"DEBUG: Removed quotes, IP address: {ip_address}")
-                        else:
-                            ip_address = ip_part
-                            if self.debug_mode:
-                                print(f"DEBUG: No quotes found, IP address: {ip_address}")
-                        
-                        # Validate that it's a valid IP address (not 0.0.0.0)
-                        if ip_address and ip_address != "0.0.0.0":
-                            if self.debug_mode:
-                                print(f"DEBUG: Valid IP address found: {ip_address}")
-                            return ip_address
-                        else:
-                            if self.debug_mode:
-                                print(f"DEBUG: Invalid IP address: {ip_address}")
-            
-            if self.debug_mode:
-                print(f"DEBUG: No valid IP address found in response")
-            return None
+                            print(f"DEBUG: Extracted candidate: {candidate}")
+                        # Validate IPv4
+                        if re.match(r"^\d+\.\d+\.\d+\.\d+$", candidate) and candidate != "0.0.0.0":
+                            ip_address = candidate
+                            break
+
+            if ip_address:
+                if self.debug_mode:
+                    print(f"DEBUG: Valid IP address: {ip_address}")
+                return ip_address
+            else:
+                if self.debug_mode:
+                    print("DEBUG: No valid IPv4 address found")
+                return None
+
         except Exception as e:
             print(f"Error getting IP address: {e}")
             return None
-    
+
+
     def configure_network(self, ip_address):
         """Configure network interface with IP address"""
         try:
@@ -680,106 +716,90 @@ class FibocomMonitor:
         """Disconnect from the modem and restore previous settings"""
         try:
             self.update_status("Disconnecting...")
-            
+
             # Stop monitoring
             self.monitoring = False
             if self.serial_port:
                 self.serial_port.close()
                 self.serial_port = None
-            
-            # Only run batch if any network config was done
-            if self.network_configured or self.dns_changed or self.modemmanager_stopped:
-                # Find interface and IP
-                interface = self.find_modem_interface() if self.network_configured else None
-                ip_addr = None
-            if interface:
-                result = subprocess.run(['ip', '-4', 'addr', 'show', interface], capture_output=True, text=True)
-                if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        line = line.strip()
-                        if line.startswith('inet '):
-                            ip_addr = line.split()[1]  # e.g. '100.112.132.84/32'
-                            break
-                # Batch all privileged teardown commands
-                batch_cmd = ""
-                if self.dns_changed:
-                    batch_cmd += "cp /etc/resolv.conf.backup /etc/resolv.conf && "
-                if self.network_configured and interface and ip_addr:
-                    batch_cmd += f"ip addr del {ip_addr} dev {interface} && ip link set {interface} down && "
-                if self.modemmanager_stopped:
-                    batch_cmd += "systemctl start ModemManager && "
-                # Remove trailing &&
-                if batch_cmd.endswith("&& "):
-                    batch_cmd = batch_cmd[:-3]
-                if batch_cmd:
-                    result = self.run_privileged_command(batch_cmd)
-                    if result.returncode != 0:
-                        print(f"Warning: Failed to fully restore system: {result.stderr}")
-                self.network_configured = False
-                self.dns_changed = False
-                self.modemmanager_stopped = False
-                self.interface_name = None # Clear interface name on disconnect
+
+            batch_cmd = ""
+
+            # Restore DNS
+            if self.dns_changed:
+                batch_cmd += "mv /etc/resolv.conf.backup /etc/resolv.conf || true && "
+
+            # Clean up network interface
+            if self.network_configured and self.interface_name:
+                batch_cmd += (
+                    f"ip addr flush dev {self.interface_name} && "
+                    f"ip route flush dev {self.interface_name} && "
+                    f"ip link set {self.interface_name} down && "
+                )
+
+            # Restart ModemManager reliably
+            if self.modemmanager_stopped:
+                batch_cmd += "systemctl unmask ModemManager || true && systemctl enable --now ModemManager && "
+
+            # Trim trailing &&
+            if batch_cmd.endswith("&& "):
+                batch_cmd = batch_cmd[:-3]
+
+            # Run teardown if needed
+            if batch_cmd:
+                result = self.run_privileged_command(batch_cmd)
+                if result.returncode != 0:
+                    print(f"Warning: Failed to fully restore system: {result.stderr}")
+
+            # Reset flags
+            self.network_configured = False
+            self.dns_changed = False
+            self.modemmanager_stopped = False
+            self.interface_name = None
 
             # Update UI
             self.connect_btn.config(text="Connect")
             self.status_label.config(text="Disconnected", style='Error.TLabel')
             self.update_status("Disconnected successfully")
-            
+
         except Exception as e:
             print(f"Error during disconnect: {e}")
-            # Still update UI even if there's an error
             self.connect_btn.config(text="Connect")
             self.status_label.config(text="Disconnected", style='Error.TLabel')
+
             
-    def send_at_command(self, command, timeout=5):
-        """Send AT command to modem and return response"""
-        if not self.serial_port:
-            return ""
-            
-        try:
-            if self.debug_mode:
-                print(f"DEBUG: Sending command: {command}")
-                
-            # Clear any pending data
-            self.serial_port.reset_input_buffer()
-            
-            # First disable echo if this is not an echo command
-            if not command.startswith("ATE"):
-                self.serial_port.write(b"ATE0\r\n")
-                time.sleep(0.1)
-                self.serial_port.reset_input_buffer()
-            
-            # Send command
-            self.serial_port.write(f"{command}\r\n".encode())
-            time.sleep(0.3) # Give modem more time to process
-            
-            response = ""
-            start_time = time.time()
-            
-            if self.debug_mode:
-                print(f"DEBUG: Reading response from modem...")
-            
-            while time.time() - start_time < timeout:
-                if self.serial_port.in_waiting:
-                    line = self.serial_port.readline().decode().strip()
-                    if line:
-                        response += line + "\n"
-                        if self.debug_mode:
-                            print(f"DEBUG: Received line: {repr(line)}")
-                        
-                        # Stop if we see OK or ERROR
-                        if line in ["OK", "ERROR"]:
-                            if self.debug_mode:
-                                print(f"DEBUG: Stopping read after: {line}")
-                            break
-                            
-            if self.debug_mode:
-                print(f"DEBUG: Final response for {command}: {repr(response)}")
-                
-            return response
-        except Exception as e:
-            print(f"Error sending AT command {command}: {e}")
-            return ""
+    def send_at_command(self, command, timeout=2):
+        """Send an AT command and return the whole response."""
+        if not self.serial_port or not self.serial_port.is_open:
+            raise RuntimeError("serial port not open")
+
+        self.serial_port.reset_input_buffer()
+        cmd_line = (command + "\r").encode()
+        self.serial_port.write(cmd_line)
+
+        lines, echo_seen = [], False
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            raw = self.serial_port.readline()
+            if not raw:
+                time.sleep(0.01)
+                continue
+            line = raw.decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            # skip the echo of the command itself (only once)
+            if not echo_seen and line == command:
+                echo_seen = True
+                continue
+
+            lines.append(line)
+
+            # stop on real result code
+            if line in {"OK", "ERROR"} or line.startswith("+CME ERROR"):
+                break
+
+        return "\n".join(lines)
             
     def parse_at_response(self, response, command):
         """Parse AT command response"""
@@ -1085,60 +1105,46 @@ class FibocomMonitor:
                     self.status_info["rsrq"] = rsrq
                 if sinr and sinr != "N/A":
                     self.status_info["sinr"] = sinr
-            
+                    
+      
     def get_cells_info(self):
         """Get cells information using GTCCINFO command"""
+        if self.debug_mode:
+            print("DEBUG: Getting cell info...")
+        
         try:
-            # Get cell information using the correct command
             response = self.send_at_command("AT+GTCCINFO?")
-            
-            # Parse cell information
-            cells = []
-            if response and "GTCCINFO:" in response:
+            new_cells = []
+            if response:
                 lines = response.split('\n')
+                parsing_cells = False
                 for line in lines:
                     line = line.strip()
-                    # Look for lines that contain cell data (not the header line)
-                    if line and not line.startswith("+GTCCINFO:") and "," in line:
+                    if line.startswith("+GTCCINFO:"):
+                        parsing_cells = True
+                        continue
+                    if parsing_cells and line and not line.startswith("OK"):
+                        if self.debug_mode:
+                            print(f"DEBUG: Received line: {line}")
                         try:
-                            # Parse cell info from GTCCINFO response
-                            # Format: <is_service_cell>,<rat>,<mcc>,<mnc>,<tac_lac>,<cell_id>,<arfcn>,<p_cell_id>,<band>,<bandwidth>,<sinr>,<rsrp>,<rsrq>
                             parts = line.split(',')
                             if len(parts) >= 13:
                                 is_service = parts[0] == "1"
-                                rat = parts[1]
-                                mcc = parts[2] if parts[2] != '' else "N/A"
-                                mnc = parts[3] if parts[3] != '' else "N/A"
-                                cell_id = parts[5] if parts[5] != '0xFFFFFFF' and parts[5] != '' else "N/A"
-                                pci = parts[7] if parts[7] != '0xFFFFFFF' and parts[7] != '' else "N/A"
+                                rat_code = parts[1]
+                                cell_id = parts[5] if parts[5] not in ('0xFFFFFFF', '00FFFFFFF', '') else "N/A"
+                                pci = parts[7] if parts[7] not in ('0xFFFFFFF', '00FFFFFFF', '') else "N/A"
                                 arfcn = parts[6] if parts[6] != '0' and parts[6] != '' else "N/A"
                                 band = parts[8] if parts[8] != '' else "N/A"
                                 
-                                # Convert RAT code to name
-                                rat_name = "LTE" if rat == "4" else "UMTS" if rat == "2" else "NR" if rat == "9" else "Unknown"
+                                rat_name = "LTE" if rat_code == "4" else "UMTS" if rat_code == "2" else "NR" if rat_code == "9" else "Unknown"
                                 
-                                # Parse signal metrics
-                                sinr_val = int(parts[10]) if len(parts) > 10 and parts[10] != '255' and parts[10] != '' else None
-                                rsrp_val = int(parts[11]) if len(parts) > 11 and parts[11] != '255' and parts[11] != '' else None
-                                rsrq_val = int(parts[12]) if len(parts) > 12 and parts[12] != '255' and parts[12] != '' else None
+                                sinr_val = int(parts[10]) if len(parts) > 10 and parts[10] not in ('255', '') else None
+                                rsrp_val = int(parts[11]) if len(parts) > 11 and parts[11] not in ('255', '') else None
+                                rsrq_val = int(parts[12]) if len(parts) > 12 and parts[12] not in ('255', '') else None
                                 
-                                # Convert signal metrics
-                                sinr = (sinr_val / 2) if sinr_val is not None else None
-                                rsrp = (rsrp_val - 141) if rsrp_val is not None else None  # Convert to dBm
-                                rsrq = ((rsrq_val / 2) - 20) if rsrq_val is not None else None  # Convert to dB
-                                
-                                # Format cell ID and PCI for display
-                                if cell_id != "N/A" and cell_id.startswith("0x"):
-                                    try:
-                                        cell_id = str(int(cell_id, 16))
-                                    except:
-                                        pass
-                                        
-                                if pci != "N/A" and pci.startswith("0x"):
-                                    try:
-                                        pci = str(int(pci, 16))
-                                    except:
-                                        pass
+                                sinr = (sinr_val / 2) if sinr_val is not None else "N/A"
+                                rsrp = (rsrp_val - 141) if rsrp_val is not None else "N/A"
+                                rsrq = ((rsrq_val / 2) - 20) if rsrq_val is not None else "N/A"
                                 
                                 cell_info = {
                                     "rat": rat_name,
@@ -1146,23 +1152,29 @@ class FibocomMonitor:
                                     "pci": pci,
                                     "band": band,
                                     "earfcn": arfcn,
-                                    "rsrp": f"{rsrp:.0f}dBm" if rsrp else "N/A",
-                                    "rsrq": f"{rsrq:.1f}dB" if rsrq else "N/A",
-                                    "sinr": f"{sinr:.1f}dB" if sinr else "N/A",
+                                    "rsrp": f"{rsrp:.0f}dBm" if rsrp != "N/A" else "N/A",
+                                    "rsrq": f"{rsrq:.1f}dB" if rsrq != "N/A" else "N/A",
+                                    "sinr": f"{sinr:.1f}dB" if sinr != "N/A" else "N/A",
                                     "service": "Yes" if is_service else "No"
                                 }
-                                cells.append(cell_info)
-                                print(f"Parsed cell: {cell_info}")  # Debug output
+                                new_cells.append(cell_info)
+                                if self.debug_mode:
+                                    print(f"Parsed cell: {cell_info}")
                         except Exception as e:
-                            print(f"Error parsing cell info line '{line}': {e}")
-                            
-            # If no cells found, fallback to basic signal info
-            if not cells:
-                print("No cells found, using fallback")
+                            if self.debug_mode:
+                                print(f"Error parsing cell info line '{line}': {e}")
+                    elif parsing_cells and line.startswith("OK"):
+                        parsing_cells = False
+                        
+            if not new_cells:
+                if self.debug_mode:
+                    print("No cells found, using fallback")
                 response = self.send_at_command("AT+CSQ")
-                csq = self.parse_at_response(response, "CSQ")
-                if csq:
-                    cells.append({
+                csq_match = re.search(r'\+CSQ: (\d+),(\d+)', response)
+                if csq_match:
+                    csq = int(csq_match.group(1))
+                    signal_pct = (csq * 100) / 31
+                    new_cells.append({
                         "rat": "LTE",
                         "cell_id": "N/A",
                         "pci": "N/A",
@@ -1173,109 +1185,116 @@ class FibocomMonitor:
                         "sinr": "N/A",
                         "service": "Yes"
                     })
-                        
-            self.cells_info = cells
-            print(f"Total cells found: {len(cells)}")
+                    if self.debug_mode:
+                        print(f"Using CSQ fallback: {csq} -> {signal_pct:.2f}%")
+            
+            updated_cells = self.cells_info[:]
+            for new_cell in new_cells:
+                found = False
+                for i, existing_cell in enumerate(updated_cells):
+                    if existing_cell['rat'] == new_cell['rat']:
+                        updated_cells[i].update(new_cell)
+                        found = True
+                        break
+                if not found:
+                    updated_cells.append(new_cell)
+
+            self.cells_info = updated_cells
+            if self.debug_mode:
+                print(f"Total cells found: {len(self.cells_info)}")
+            self.update_cells_tab()
             
         except Exception as e:
-            print(f"Error getting cells info: {e}")
-            
+            if self.debug_mode:
+                print(f"Error getting cells info: {e}")
+
+                
+
     def get_ca_info(self):
-        """Get carrier aggregation information using GTCAINFO command"""
+        """Get Carrier Aggregation information and update the instance variable."""
+        self.ca_tree.delete(*self.ca_tree.get_children())
+        self.ca_info = {}  # Initialize the instance variable
         try:
-            # Get carrier aggregation info using the correct command
             response = self.send_at_command("AT+GTCAINFO?")
+            if self.debug_mode:
+                print(f"DEBUG: Raw CA command response:\n{response}")
             
-            # Parse CA information
-            ca_cells = []
-            if response and "GTCAINFO:" in response:
-                lines = response.split('\n')
+            if response:
+                lines = response.split('\r\n')
                 for line in lines:
                     line = line.strip()
-                    # Look for lines that contain CA data (not the header line)
-                    if line and not line.startswith("+GTCAINFO:") and ("," in line or ":" in line):
-                        try:
-                            # Parse CA info from GTCAINFO response
-                            # Format: PCC:<p_cell_id>,<arfcn>,<dl_bandwidth>,<ul_bandwidth>,<dl_mimo>,<ul_mimo>,<dl_modulation>,<ul_modulation>
-                            # or: SCC<num>:<upload>,<p_cell_id>,<arfcn>,<dl_bandwidth>,<ul_bandwidth>,<dl_mimo>,<ul_mimo>,<dl_modulation>,<ul_modulation>
-                            if "PCC:" in line:
-                                parts = line.split(',')
-                                if len(parts) >= 8:
-                                    pci = parts[0].split(':')[1] if parts[0].split(':')[1] != '0xFFFFFFF' and parts[0].split(':')[1] != '' else "N/A"
-                                    arfcn = parts[1] if parts[1] != '0' and parts[1] != '' else "N/A"
-                                    dl_bw = parts[2] if parts[2] != '0' and parts[2] != '' else "N/A"
-                                    ul_bw = parts[3] if parts[3] != '0' and parts[3] != '' else "N/A"
-                                    dl_mod = parts[6] if parts[6] != '0' and parts[6] != '' else "N/A"
-                                    ul_mod = parts[7] if parts[7] != '0' and parts[7] != '' else "N/A"
-                                    
-                                    # Format PCI for display
-                                    if pci != "N/A" and pci.startswith("0x"):
-                                        try:
-                                            pci = str(int(pci, 16))
-                                        except:
-                                            pass
-                                    
-                                    ca_cells.append({
-                                        "component": "PCC",
-                                        "pci": pci,
-                                        "band": "N/A",  # Would need band conversion
-                                        "earfcn": arfcn,
-                                        "dl_bandwidth": dl_bw,
-                                        "ul_bandwidth": ul_bw,
-                                        "dl_modulation": dl_mod,
-                                        "ul_modulation": ul_mod
-                                    })
-                                    print(f"Parsed PCC: {ca_cells[-1]}")  # Debug output
-                            elif "SCC" in line:
-                                parts = line.split(',')
-                                if len(parts) >= 9:
-                                    pci = parts[1] if parts[1] != '0xFFFFFFF' and parts[1] != '' else "N/A"
-                                    arfcn = parts[2] if parts[2] != '0' and parts[2] != '' else "N/A"
-                                    dl_bw = parts[3] if parts[3] != '0' and parts[3] != '' else "N/A"
-                                    ul_bw = parts[4] if parts[4] != '0' and parts[4] != '' else "N/A"
-                                    dl_mod = parts[7] if parts[7] != '0' and parts[7] != '' else "N/A"
-                                    ul_mod = parts[8] if parts[8] != '0' and parts[8] != '' else "N/A"
-                                    
-                                    # Format PCI for display
-                                    if pci != "N/A" and pci.startswith("0x"):
-                                        try:
-                                            pci = str(int(pci, 16))
-                                        except:
-                                            pass
-                                    
-                                    ca_cells.append({
-                                        "component": "SCC",
-                                        "pci": pci,
-                                        "band": "N/A",  # Would need band conversion
-                                        "earfcn": arfcn,
-                                        "dl_bandwidth": dl_bw,
-                                        "ul_bandwidth": ul_bw,
-                                        "dl_modulation": dl_mod,
-                                        "ul_modulation": ul_mod
-                                    })
-                                    print(f"Parsed SCC: {ca_cells[-1]}")  # Debug output
-                        except Exception as e:
-                            print(f"Error parsing CA info line '{line}': {e}")
-                            
-            # If no CA info found, create a basic entry
-            if not ca_cells:
-                print("No CA info found, using fallback")
-                ca_cells.append({
-                    "component": "PCC",
-                    "pci": "N/A",
-                    "band": "N/A",
-                    "earfcn": "N/A",
-                    "dl_bandwidth": "N/A",
-                    "ul_bandwidth": "N/A",
-                    "dl_modulation": "N/A",
-                    "ul_modulation": "N/A"
-                })
-                        
-            self.ca_info = ca_cells
-            print(f"Total CA components found: {len(ca_cells)}")
-            
+                    if line.startswith("PCC:"):
+                        # Parse Primary Component Carrier (PCC)
+                        parts = line.split(':')[-1].split(',')
+                        if len(parts) >= 8:
+                            self.ca_info['PCC'] = {
+                                'band': parts[0],
+                                'dl_earfcn': parts[1],
+                                'ul_earfcn': parts[2],
+                                'bandwidth': parts[3],
+                                'pci': parts[4],
+                                'mimo': parts[5],
+                                'mod_dl': parts[6],
+                                'mod_ul': parts[7]
+                            }
+                    elif re.match(r"SCC\d+:", line):
+                        # Parse Secondary Component Carrier (SCC)
+                        scc_num = re.search(r"SCC(\d+):", line).group(1)
+                        parts = line.split(':')[-1].split(',')
+                        if len(parts) >= 14:
+                            self.ca_info[f'SCC{scc_num}'] = {
+                                'band': parts[0],
+                                'dl_earfcn': parts[1],
+                                'ul_earfcn': parts[2],
+                                'pci': parts[3],
+                                'bandwidth': parts[4],
+                                'rsrp': parts[5],
+                                'rsrq': parts[6],
+                                'snr': parts[7],
+                                'mimo': parts[8],
+                                'mod_dl': parts[9],
+                                'mod_ul': parts[10],
+                                'additional_info': parts[11:]
+                            }
         except Exception as e:
-            print(f"Error getting CA info: {e}")
+            if self.debug_mode:
+                print(f"DEBUG: Error getting CA info: {e}")
+            return
+
+        # Display the parsed information in the Treeview
+        if self.ca_info:
+            if 'PCC' in self.ca_info:
+                pcc_data = self.ca_info['PCC']
+                self.ca_tree.insert('', 'end', text="Primary Component Carrier (PCC)", open=True)
+                self.ca_tree.insert('', 'end', values=("Band", pcc_data['band']))
+                self.ca_tree.insert('', 'end', values=("DL EARFCN", pcc_data['dl_earfcn']))
+                self.ca_tree.insert('', 'end', values=("UL EARFCN", pcc_data['ul_earfcn']))
+                self.ca_tree.insert('', 'end', values=("PCI", pcc_data['pci']))
+                self.ca_tree.insert('', 'end', values=("Bandwidth", f"{pcc_data['bandwidth']} MHz"))
+                self.ca_tree.insert('', 'end', values=("MIMO", pcc_data['mimo']))
+                self.ca_tree.insert('', 'end', values=("DL Modulation", pcc_data['mod_dl']))
+                self.ca_tree.insert('', 'end', values=("UL Modulation", pcc_data['mod_ul']))
+                self.ca_tree.insert('', 'end', values=("", ""))
+            
+            scc_keys = sorted([k for k in self.ca_info if k.startswith('SCC')], key=lambda x: int(x.replace('SCC', '')))
+            for scc_key in scc_keys:
+                scc_data = self.ca_info[scc_key]
+                scc_num = scc_key.replace('SCC', '')
+                self.ca_tree.insert('', 'end', text=f"Secondary Component Carrier (SCC{scc_num})", open=True)
+                self.ca_tree.insert('', 'end', values=("Band", scc_data['band']))
+                self.ca_tree.insert('', 'end', values=("DL EARFCN", scc_data['dl_earfcn']))
+                self.ca_tree.insert('', 'end', values=("UL EARFCN", scc_data['ul_earfcn']))
+                self.ca_tree.insert('', 'end', values=("PCI", scc_data['pci']))
+                self.ca_tree.insert('', 'end', values=("Bandwidth", f"{scc_data['bandwidth']} MHz"))
+                self.ca_tree.insert('', 'end', values=("RSRP", scc_data['rsrp']))
+                self.ca_tree.insert('', 'end', values=("RSRQ", scc_data['rsrq']))
+                self.ca_tree.insert('', 'end', values=("SNR", scc_data['snr']))
+                self.ca_tree.insert('', 'end', values=("MIMO", scc_data['mimo']))
+                self.ca_tree.insert('', 'end', values=("DL Modulation", scc_data['mod_dl']))
+                self.ca_tree.insert('', 'end', values=("UL Modulation", scc_data['mod_ul']))
+                if 'additional_info' in scc_data:
+                    self.ca_tree.insert('', 'end', values=("Additional Info", ', '.join(scc_data['additional_info'])))
+                self.ca_tree.insert('', 'end', values=("", ""))
             
     def get_signal_bars(self, value, min_val, max_val):
         """Convert signal value to visual bars and percent"""
@@ -1367,19 +1386,7 @@ class FibocomMonitor:
                     cell.get("service", "--")
                 ))
 
-            # Update CA treeview
-            self.ca_tree.delete(*self.ca_tree.get_children())
-            for ca in self.ca_info:
-                self.ca_tree.insert("", "end", values=(
-                    ca.get("component", "--"),
-                    ca.get("pci", "--"),
-                    ca.get("band", "--"),
-                    ca.get("earfcn", "--"),
-                    ca.get("dl_bandwidth", "--"),
-                    ca.get("ul_bandwidth", "--"),
-                    ca.get("dl_modulation", "--"),
-                    ca.get("ul_modulation", "--")
-                ))
+
         except Exception as e:
             print(f"Error updating UI: {e}")
             
