@@ -1,5 +1,4 @@
-# RxTxSemi FM350-GL Connect (Linux)
-
+# RxTxSemi FM350-GL Connect 
 A Linux GUI tool for monitoring and managing Fibocom FM350-GL modems.
 
 👉 Don’t have the modem yet? Get the official RxTxSemi FM350-GL 5G USB Dongle here:  
